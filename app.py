@@ -1,302 +1,433 @@
-import time
-import os
-import pandas as pd
-import numpy as np
-import streamlit as st
-from pathlib import Path
+"""
+Selecta-style UI wired to VisualAddSimilarity backend (main mock + boost + similarity).
 
-st.set_page_config(
-    page_title="Creative Portfolio Analysis",
-    page_icon="📊",
-    layout="wide",
-    initial_sidebar_state="expanded",
+Run locally from this repo root:
+  .\\scripts\\run_local_ui.ps1
+  # or: py -m pip install -e ".[ui]" && py -m visual_add_similarity.streamlit_launcher
+
+Local dev only (optional): set `SMADEX_DATASET` to a zip or Smadex folder; otherwise the app uses the bundled dataset when present.
+"""
+from __future__ import annotations
+
+import html
+import os
+import time
+import zipfile
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import pandas as pd
+import streamlit as st
+
+from visual_add_similarity.backend import (
+    BackendWeights,
+    SmadexDatasetRepository,
+    run_backend_for_application,
 )
+
+
+def _resolve_dataset_path() -> str:
+    """
+    Workspace data location (not shown in UI). Production: replace with your API/DB layer.
+    Resolution: SMADEX_DATASET env, then bundled selecta-reference folder for local demos.
+    """
+    env = os.environ.get("SMADEX_DATASET", "").strip()
+    if env and Path(env).exists():
+        return env
+    ref = Path(__file__).resolve().parent / "Smadex_Creative_Intelligence_Dataset_FULL"
+    if ref.is_dir():
+        return str(ref)
+    return ""
+
+
+STATUS_LABELS = {"PRUNE": "Hold", "REVIEW": "Watch", "PURSUE": "Grow"}
+STATUS_KEYS = {"Hold": "PRUNE", "Watch": "REVIEW", "Grow": "PURSUE"}
+
+
+def _short_reason(recommendation: str) -> str:
+    if recommendation == "PRUNE":
+        return "Looks like creatives that are already earning more."
+    if recommendation == "REVIEW":
+        return "Close to something that is working — check before you scale."
+    return "Visually distinct from what is winning — good candidate to lean on."
+
 
 STYLE = """
 <style>
-* {
+  :root {
+    --bg: #fbfbfd;
+    --surface: #ffffff;
+    --sidebar: #f5f5f7;
+    --text: #1d1d1f;
+    --text2: #6e6e73;
+    --text3: #86868b;
+    --line: rgba(0, 0, 0, 0.08);
+    --accent: #0071e3;
+    --accent-hover: #0077ed;
     --radius: 12px;
-    --radius-compact: 8px;
-    --bg-light: #FFFFFF;
-    --bg-slightly-lighter: #F5F5F5;
-    --text-primary: #1A1A1A;
-    --text-secondary: rgba(26, 26, 26, 0.65);
-    --text-tertiary: rgba(26, 26, 26, 0.45);
-    --border-light: #D0D0CE;
-    --accent: #5B4FD6;
-    --accent-dark: #4A3FC4;
-    --success: #0D6F44;
-    --warning: #C17600;
-    --error: #B70000;
-    --transition: 0.12s ease;
-}
+    --shadow: 0 1px 2px rgba(0,0,0,0.04), 0 4px 12px rgba(0,0,0,0.06);
+    --font: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui, sans-serif;
+  }
 
-[data-testid="stAppViewContainer"] {
-    background: var(--bg-light);
-}
+  html, body, [data-testid="stAppViewContainer"] {
+    background: var(--bg) !important;
+    color: var(--text);
+    font-family: var(--font);
+    -webkit-font-smoothing: antialiased;
+  }
 
-[data-testid="stSidebar"] {
-    background: var(--bg-slightly-lighter);
-}
+  [data-testid="stSidebar"] {
+    background: var(--sidebar) !important;
+    border-right: 1px solid var(--line) !important;
+  }
 
-html, body, [data-testid="stMarkdownContainer"] {
-    background: var(--bg-light);
-    color: var(--text-primary);
-}
+  [data-testid="stSidebar"] .stMarkdown h3 {
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    color: var(--text2);
+    margin: 20px 0 8px 0;
+    text-transform: none;
+  }
 
-main {
-    background: var(--bg-light);
-}
+  main .block-container {
+    padding: 28px 32px 48px;
+    max-width: 1080px;
+  }
 
-main .block-container {
-    padding: 32px 24px;
-    max-width: 1400px;
-    background: var(--bg-light);
-}
+  h1, h2, h3 {
+    font-family: var(--font);
+    font-weight: 600;
+    letter-spacing: -0.022em;
+    color: var(--text);
+  }
 
-h1, h2, h3, h4, h5, h6 {
-    font-weight: 500;
-    letter-spacing: -0.02em;
-    line-height: 1.3;
-    color: var(--text-primary);
-}
+  h1 { font-size: 28px; line-height: 1.15; margin: 0 0 6px 0; font-weight: 600; }
+  h2 { font-size: 22px; line-height: 1.2; margin: 0 0 8px 0; font-weight: 600; }
+  h3 { font-size: 17px; line-height: 1.25; margin: 0 0 12px 0; font-weight: 600; }
 
-h1 {
-    font-size: 28px;
-    margin: 0 0 16px 0;
-}
+  p, span, label { color: var(--text2); }
 
-h2 {
-    font-size: 22px;
-    margin: 0 0 12px 0;
-}
+  .hero-sub {
+    font-size: 15px;
+    line-height: 1.45;
+    color: var(--text3);
+    margin: 0 0 28px 0;
+    max-width: 42em;
+  }
 
-h3 {
-    font-size: 18px;
-    margin: 0 0 12px 0;
-}
-
-p {
-    margin: 0;
-    line-height: 1.6;
-    color: var(--text-secondary);
-    font-size: 14px;
-}
-
-.stTabs [data-baseweb="tab-list"] {
-    background-color: transparent;
-    border-bottom: 2px solid var(--border-light);
-    gap: 32px;
-    padding: 0;
-}
-
-.stTabs [data-baseweb="tab"] {
-    font-weight: 400;
-    color: var(--text-secondary);
-    padding: 12px 0;
-    border-bottom: 3px solid transparent;
-    transition: color var(--transition), border-color var(--transition);
-}
-
-.stTabs [aria-selected="true"] {
-    border-bottom-color: var(--accent);
-    color: var(--text-primary);
+  [data-testid="stTabs"] { margin-top: 8px; }
+  [data-testid="stTabs"] [data-baseweb="tab-list"] {
+    gap: 8px;
+    border-bottom: 1px solid var(--line);
     background: transparent;
+    padding: 0;
+  }
+  [data-testid="stTabs"] [data-baseweb="tab"] {
+    font-size: 14px;
     font-weight: 500;
-}
+    color: var(--text3);
+    padding: 10px 14px;
+    border-radius: 8px 8px 0 0;
+    border: none !important;
+  }
+  [data-testid="stTabs"] [aria-selected="true"] {
+    color: var(--text) !important;
+    font-weight: 600;
+    background: var(--surface) !important;
+    box-shadow: 0 -1px 0 var(--surface);
+    border-bottom: 2px solid var(--accent) !important;
+  }
 
-.recommendation-prune {
-    background: #FEF3F3;
-    border-left: 3px solid var(--error);
+  .stButton > button {
+    background: var(--accent) !important;
+    color: #fff !important;
+    border: none !important;
+    border-radius: 980px !important;
+    font-weight: 500 !important;
+    font-size: 14px !important;
+    padding: 0.55rem 1.35rem !important;
+    transition: background 0.15s ease !important;
+  }
+  .stButton > button:hover { background: var(--accent-hover) !important; }
+
+  [data-testid="stTextInput"] input,
+  [data-testid="stSelectbox"] div[data-baseweb="select"] > div,
+  [data-testid="stNumberInput"] input {
+    border-radius: 10px !important;
+    border: 1px solid var(--line) !important;
+    background: var(--surface) !important;
+    font-size: 14px !important;
+  }
+
+  [data-testid="stMetricValue"] {
+    font-weight: 600 !important;
+    font-size: 26px !important;
+    letter-spacing: -0.02em;
+    color: var(--text) !important;
+  }
+  [data-testid="stMetricLabel"] {
+    font-size: 12px !important;
+    font-weight: 500 !important;
+    color: var(--text3) !important;
+    text-transform: none !important;
+  }
+
+  [data-testid="metric-container"] {
+    background: var(--surface) !important;
+    border: 1px solid var(--line) !important;
+    border-radius: var(--radius) !important;
+    padding: 16px 18px !important;
+    box-shadow: none !important;
+  }
+
+  .cu-card {
+    background: var(--surface);
+    border: 1px solid var(--line);
     border-radius: var(--radius);
-    padding: 16px 20px;
-    margin: 16px 0;
-    font-size: 14px;
-    line-height: 1.6;
-    color: var(--text-secondary);
-}
+    padding: 16px 18px;
+    margin-bottom: 10px;
+    box-shadow: var(--shadow);
+  }
+  .cu-card-hold { border-left: 3px solid #aeaeb2; }
+  .cu-card-watch { border-left: 3px solid #d4a574; }
+  .cu-card-grow { border-left: 3px solid #6bab90; }
 
-.recommendation-pursue {
-    background: #F0FAF7;
-    border-left: 3px solid var(--success);
-    border-radius: var(--radius);
-    padding: 16px 20px;
-    margin: 16px 0;
-    font-size: 14px;
-    line-height: 1.6;
-    color: var(--text-secondary);
-}
-
-.recommendation-review {
-    background: #FEF7EC;
-    border-left: 3px solid var(--warning);
-    border-radius: var(--radius);
-    padding: 16px 20px;
-    margin: 16px 0;
-    font-size: 14px;
-    line-height: 1.6;
-    color: var(--text-secondary);
-}
-
-.stTextInput > div > div > input,
-.stSelectbox > div > div > select,
-.stNumberInput > div > div > input {
-    border-radius: var(--radius-compact);
-    border: 1px solid var(--border-light);
-    background: var(--bg-light);
-    color: var(--text-primary);
-    font-size: 14px;
-    padding: 10px 12px;
-    transition: border-color var(--transition), box-shadow var(--transition);
-}
-
-.stTextInput > div > div > input:focus,
-.stSelectbox > div > div > select:focus {
-    border-color: var(--accent);
-    outline: none;
-    box-shadow: 0 0 0 3px rgba(91, 79, 214, 0.12);
-}
-
-.stButton > button {
-    background-color: var(--accent);
-    color: #FFFFFF;
-    border: none;
-    border-radius: var(--radius);
+  .cu-badge {
+    display: inline-block;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--text3);
+    margin-bottom: 6px;
+  }
+  .cu-title {
+    font-size: 15px;
     font-weight: 500;
-    font-size: 14px;
-    padding: 10px 20px;
-    height: 40px;
-    transition: background-color var(--transition), opacity var(--transition);
-}
-
-.stButton > button:hover {
-    background-color: var(--accent-dark);
-}
-
-.stButton > button:active {
-    opacity: 0.92;
-}
-
-[data-testid="metric-container"] {
-    background: var(--bg-slightly-lighter);
-    border: 1px solid var(--border-light);
-    border-radius: var(--radius);
-    padding: 16px;
-}
-
-[data-testid="stMetricValue"] {
+    color: var(--text);
+    letter-spacing: -0.015em;
+    line-height: 1.35;
+  }
+  .cu-meta {
+    font-size: 13px;
     font-weight: 500;
-    font-size: 24px;
-    color: var(--text-primary);
-}
+    color: var(--text2);
+    text-align: right;
+    white-space: nowrap;
+  }
+  .cu-reason {
+    font-size: 13px;
+    line-height: 1.5;
+    color: var(--text3);
+    margin: 10px 0 0 0;
+  }
 
-[data-testid="stMetricDelta"] {
-    font-size: 12px;
-    color: var(--text-tertiary);
-}
+  hr { border: none; border-top: 1px solid var(--line); margin: 20px 0; }
 
-[data-testid="stMetricLabel"] {
-    font-size: 12px;
-    color: var(--text-secondary);
-    font-weight: 400;
-}
-
-.stDivider {
-    border: none;
-    height: 1px;
-    background-color: var(--border-light);
-    margin: 24px 0;
-}
-
-[data-testid="stAlert"] {
-    background: var(--bg-slightly-lighter);
-    border: 1px solid var(--border-light);
+  [data-testid="stExpander"] {
+    border: 1px solid var(--line);
     border-radius: var(--radius);
-    color: var(--text-primary);
-}
+    background: var(--surface);
+    margin-bottom: 8px;
+  }
 
-.stSlider > div > div > div {
-    color: var(--accent);
-}
-
-.stMultiSelect [data-baseweb="tag"] {
-    background-color: var(--accent);
-}
-
-.stMultiSelect > div > div > div {
-    border: 1px solid var(--border-light);
-}
+  #MainMenu {visibility: hidden;}
+  footer {visibility: hidden;}
+  header[data-testid="stHeader"] { background: var(--bg); border-bottom: 1px solid var(--line); }
 </style>
 """
 
-st.markdown(STYLE, unsafe_allow_html=True)
 
-DATA_PATH = Path("Smadex_Creative_Intelligence_Dataset_FULL")
-
-@st.cache_data
-def load_smadex_data():
-    """Load Smadex dataset and generate mock pruning analysis."""
+def load_merged_df(dataset_path: str) -> Optional[pd.DataFrame]:
+    p = Path(dataset_path)
     try:
-        creatives = pd.read_csv(DATA_PATH / "creatives.csv")
-        campaigns = pd.read_csv(DATA_PATH / "campaigns.csv")
-        creative_summary = pd.read_csv(DATA_PATH / "creative_summary.csv")
-        
-        # Merge data
-        df = creatives.merge(campaigns[["campaign_id", "daily_budget_usd"]], on="campaign_id", how="left")
-        df = df.merge(creative_summary[["creative_id", "total_clicks", "total_impressions", "total_conversions", "total_revenue_usd", "overall_ctr", "creative_status"]], 
-                     on="creative_id", how="left")
-        
-        # Calculate conversion rate for revenue proxy
-        df["conv_rate"] = df["total_conversions"] / (df["total_clicks"] + 1)
-        df["revenue_proxy"] = df["total_revenue_usd"].fillna(0)
-        df["ctr"] = df["overall_ctr"].fillna(0)
-        
-        return df, creatives, campaigns, creative_summary
-    except Exception as e:
-        st.error(f"Error loading data: {e}")
-        return None, None, None, None
+        if p.is_file() and p.suffix.lower() == ".zip":
+            with zipfile.ZipFile(p, "r") as zf:
+                creatives = pd.read_csv(zf.open("creatives.csv"))
+                campaigns = pd.read_csv(zf.open("campaigns.csv"))
+                creative_summary = pd.read_csv(zf.open("creative_summary.csv"))
+        elif p.is_dir():
+            creatives = pd.read_csv(p / "creatives.csv")
+            campaigns = pd.read_csv(p / "campaigns.csv")
+            creative_summary = pd.read_csv(p / "creative_summary.csv")
+        else:
+            return None
+    except Exception:
+        return None
 
-@st.cache_data
-def generate_pruning_tree(df):
-    """Generate mock pruning analysis with tree structure."""
-    np.random.seed(42)
-    
-    # Group creatives by campaign for tree structure
-    campaigns = df["campaign_id"].unique()
-    
-    tree_nodes = []
-    
-    for campaign_id in campaigns[:15]:  # Limit to 15 campaigns for UI
-        campaign_creatives = df[df["campaign_id"] == campaign_id].copy()
-        
-        for idx, row in campaign_creatives.iterrows():
-            # Generate mock metrics vector similarity
-            similarity = np.random.uniform(0.3, 0.99)
-            
-            # Calculate whether to prune based on revenue and similarity
-            revenue = row["revenue_proxy"]
-            revenue_norm = (revenue - df["revenue_proxy"].min()) / (df["revenue_proxy"].max() - df["revenue_proxy"].min() + 1)
-            
-            # Higher revenue = more tolerance for similarity
+    df = creatives.merge(
+        campaigns[["campaign_id", "daily_budget_usd"]], on="campaign_id", how="left"
+    )
+    df = df.merge(
+        creative_summary[
+            [
+                "creative_id",
+                "total_clicks",
+                "total_impressions",
+                "total_conversions",
+                "total_revenue_usd",
+                "overall_ctr",
+                "creative_status",
+            ]
+        ],
+        on="creative_id",
+        how="left",
+    )
+    df["conv_rate"] = df["total_conversions"] / (df["total_clicks"] + 1)
+    df["revenue_proxy"] = df["total_revenue_usd"].fillna(0)
+    df["ctr"] = df["overall_ctr"].fillna(0)
+    return df
+
+
+@st.cache_data(show_spinner="Scoring portfolio…")
+def build_tree_from_backend(
+    dataset_path: str,
+    max_campaigns: int,
+    main_w: float,
+    boost_w: float,
+    sim_w: float,
+) -> pd.DataFrame:
+    repo = SmadexDatasetRepository(dataset_path)
+    weights = BackendWeights(
+        main_weight=main_w,
+        boost_weight=boost_w,
+        similarity_penalty_weight=sim_w,
+    )
+    df = load_merged_df(dataset_path)
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    rev_min = float(df["revenue_proxy"].min())
+    rev_max = float(df["revenue_proxy"].max())
+    rev_rng = max(rev_max - rev_min, 1e-8)
+
+    campaign_ids = sorted(df["campaign_id"].unique().tolist())[:max_campaigns]
+    nodes: List[dict] = []
+
+    for campaign_id in campaign_ids:
+        try:
+            result = run_backend_for_application(
+                str(int(campaign_id)),
+                repository=repo,
+                weights=weights,
+            )
+        except (ValueError, FileNotFoundError):
+            continue
+
+        sub = df[df["campaign_id"] == campaign_id]
+        for _, row in sub.iterrows():
+            ad_id = str(int(row["creative_id"]))
+            if ad_id not in result.final_scores:
+                continue
+            revenue = float(row["revenue_proxy"])
+            revenue_norm = (revenue - rev_min) / rev_rng
+            sim_penalty = float(result.similarity_penalties.get(ad_id, 0.0))
+            similarity = sim_penalty
             tolerance = 0.5 + (revenue_norm * 0.35)
-            
+            score = float(result.final_scores[ad_id])
+
             if similarity > tolerance:
                 recommendation = "PRUNE"
-                reason = f"Market saturation: {similarity:.0%} similar to existing creative. Recommend pausing to reduce budget waste."
             elif similarity > tolerance * 0.85:
                 recommendation = "REVIEW"
-                reason = f"High market overlap: {similarity:.0%} similar creatives. Monitor performance before scaling spend."
             else:
                 recommendation = "PURSUE"
-                reason = f"Low market saturation: {similarity:.0%} similarity. Good candidate for scaling investment."
-            
-            tree_nodes.append({
+            reason = _short_reason(recommendation)
+
+            nodes.append(
+                {
+                    "creative_id": row["creative_id"],
+                    "campaign_id": campaign_id,
+                    "app_name": row["app_name"],
+                    "theme": row.get("theme", ""),
+                    "format": row.get("format", ""),
+                    "language": row.get("language", ""),
+                    "similarity": similarity,
+                    "tolerance": tolerance,
+                    "revenue_proxy": revenue,
+                    "ctr": row["ctr"],
+                    "conv_rate": row["conv_rate"],
+                    "recommendation": recommendation,
+                    "reason": reason,
+                    "creative_path": str(row.get("asset_file", "")),
+                    "portfolio_score": score,
+                }
+            )
+
+    return pd.DataFrame(nodes)
+
+
+def _list_app_names(df: pd.DataFrame) -> List[str]:
+    return sorted(df["app_name"].astype(str).dropna().unique().tolist(), key=str.lower)
+
+
+@st.cache_data(show_spinner="Analyzing…")
+def build_tree_for_single_app(
+    dataset_path: str,
+    app_name_query: str,
+    main_w: float,
+    boost_w: float,
+    sim_w: float,
+) -> pd.DataFrame:
+    """Run backend for one app name (same contract as portfolio builder)."""
+    app_key = (app_name_query or "").strip()
+    if not app_key:
+        return pd.DataFrame()
+
+    repo = SmadexDatasetRepository(dataset_path)
+    weights = BackendWeights(
+        main_weight=main_w,
+        boost_weight=boost_w,
+        similarity_penalty_weight=sim_w,
+    )
+    df = load_merged_df(dataset_path)
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    mask = df["app_name"].astype(str).str.strip().str.lower() == app_key.lower()
+    if not mask.any():
+        return pd.DataFrame()
+
+    try:
+        result = run_backend_for_application(app_key, repository=repo, weights=weights)
+    except (ValueError, FileNotFoundError):
+        return pd.DataFrame()
+
+    rev_min = float(df["revenue_proxy"].min())
+    rev_max = float(df["revenue_proxy"].max())
+    rev_rng = max(rev_max - rev_min, 1e-8)
+
+    subset = df.loc[mask]
+    nodes: List[dict] = []
+    for _, row in subset.iterrows():
+        ad_id = str(int(row["creative_id"]))
+        if ad_id not in result.final_scores:
+            continue
+        revenue = float(row["revenue_proxy"])
+        revenue_norm = (revenue - rev_min) / rev_rng
+        sim_penalty = float(result.similarity_penalties.get(ad_id, 0.0))
+        similarity = sim_penalty
+        tolerance = 0.5 + (revenue_norm * 0.35)
+        score = float(result.final_scores[ad_id])
+
+        if similarity > tolerance:
+            recommendation = "PRUNE"
+        elif similarity > tolerance * 0.85:
+            recommendation = "REVIEW"
+        else:
+            recommendation = "PURSUE"
+        reason = _short_reason(recommendation)
+
+        nodes.append(
+            {
                 "creative_id": row["creative_id"],
-                "campaign_id": campaign_id,
+                "campaign_id": row["campaign_id"],
                 "app_name": row["app_name"],
-                "theme": row["theme"],
-                "format": row["format"],
-                "language": row["language"],
+                "theme": row.get("theme", ""),
+                "format": row.get("format", ""),
+                "language": row.get("language", ""),
                 "similarity": similarity,
                 "tolerance": tolerance,
                 "revenue_proxy": revenue,
@@ -304,186 +435,322 @@ def generate_pruning_tree(df):
                 "conv_rate": row["conv_rate"],
                 "recommendation": recommendation,
                 "reason": reason,
-                "creative_path": row.get("creative_path", ""),
-            })
-    
-    return pd.DataFrame(tree_nodes)
+                "creative_path": str(row.get("asset_file", "")),
+                "portfolio_score": score,
+            }
+        )
 
-def render_splash():
-    """Render loading splash screen."""
+    return pd.DataFrame(nodes)
+
+
+def _init_history() -> None:
+    if "analysis_history" not in st.session_state:
+        st.session_state.analysis_history = []
+    if "last_search_snapshot" not in st.session_state:
+        st.session_state.last_search_snapshot = None
+
+
+def _append_history(entry: Dict[str, Any]) -> None:
+    _init_history()
+    hist: List[Dict[str, Any]] = st.session_state.analysis_history
+    hist.insert(0, entry)
+    st.session_state.analysis_history = hist[:50]
+
+
+def render_splash() -> None:
     placeholder = st.empty()
     with placeholder.container():
-        st.markdown(
-            "<div style='padding: 64px; text-align: center;'>"
-            "<h1 style='color: #1A1A1A; font-size: 32px; margin-bottom: 16px;'>Creative Portfolio Analysis</h1>"
-            "<p style='color: rgba(26, 26, 26, 0.6); font-size: 15px;'>Loading analysis...</p>"
-            "</div>",
-            unsafe_allow_html=True,
-        )
-        progress = st.progress(0)
-        for percent in range(0, 101, 5):
-            time.sleep(0.08)
-            progress.progress(percent)
-    time.sleep(0.25)
-    placeholder.empty()
+        bar = st.progress(0)
+        for pct in (0.35, 0.7, 1.0):
+            time.sleep(0.06)
+            bar.progress(pct)
+        placeholder.empty()
 
-def render_header():
+
+def render_header() -> None:
     st.markdown(
-        "<div style='padding: 48px 0; margin-bottom: 40px; border-bottom: 1px solid #E4E4E2;'>"
-        "<h1 style='margin-bottom: 12px; color: #1A1A1A;'>Creative Portfolio Analysis</h1>"
-        "<p style='color: rgba(26, 26, 26, 0.6); font-size: 15px; line-height: 1.6; max-width: 600px;'>Identify which creatives to continue investing in and which to retire based on market similarity and financial performance.</p>"
-        "</div>",
+        '<h1>Portfolio</h1><p class="hero-sub">Hold, watch, or grow — from revenue and how '
+        "similar each creative looks to the rest of the set.</p>",
         unsafe_allow_html=True,
     )
 
-def render_tree_view(tree_df, filter_recommendation=None, min_revenue=0, max_similarity=1.0):
-    """Render the pruning tree view."""
-    
-    # Apply filters
+
+def render_tree_view(
+    tree_df: pd.DataFrame,
+    filter_recommendation: Optional[List[str]],
+    min_revenue: float,
+    max_similarity: float,
+) -> None:
     filtered = tree_df.copy()
-    if filter_recommendation and len(filter_recommendation) > 0:
+    if filter_recommendation:
         filtered = filtered[filtered["recommendation"].isin(filter_recommendation)]
     filtered = filtered[filtered["revenue_proxy"] >= min_revenue]
     filtered = filtered[filtered["similarity"] <= max_similarity]
-    
+
     if filtered.empty:
-        st.warning("No creatives match the selected filters.")
+        st.caption("Nothing matches these filters. Try widening them in the sidebar.")
         return
-    
-    # Display as organized cards
+
     sorted_df = filtered.sort_values("similarity", ascending=False)
-    
-    for idx, row in sorted_df.iterrows():
-        if row['recommendation'] == 'PRUNE':
-            css_class = "recommendation-prune"
-            label = "Pause"
-        elif row['recommendation'] == 'REVIEW':
-            css_class = "recommendation-review"
-            label = "Monitor"
-        else:
-            css_class = "recommendation-pursue"
-            label = "Scale"
-        
-        col1, col2, col3 = st.columns([0.8, 2, 1.2], gap="medium")
-        
-        with col1:
-            st.markdown(f"<p style='font-weight: 500; font-size: 14px; color: #1A1A1A;'>{label}</p>", unsafe_allow_html=True)
-        
-        with col2:
-            st.markdown(f"<p style='font-weight: 500; font-size: 14px; color: #1A1A1A; margin-bottom: 4px;'>{row['app_name']}</p><p style='font-size: 13px; color: rgba(26, 26, 26, 0.6);'>{row['theme']} · {row['format']}</p>", unsafe_allow_html=True)
-        
-        with col3:
-            st.markdown(f"<p style='font-size: 13px; color: rgba(26, 26, 26, 0.6);'><strong style='color: #1A1A1A;'>${row['revenue_proxy']:.0f}</strong> revenue</p><p style='font-size: 13px; color: rgba(26, 26, 26, 0.6);'>{row['similarity']:.0%} similarity</p>", unsafe_allow_html=True)
-        
-        st.markdown(
-            f"<div class='{css_class}'>"
-            f"{row['reason']}"
-            f"</div>",
-            unsafe_allow_html=True
+    for _, row in sorted_df.iterrows():
+        rec = str(row["recommendation"])
+        label = STATUS_LABELS.get(rec, rec)
+        card = "cu-card-hold" if rec == "PRUNE" else "cu-card-watch" if rec == "REVIEW" else "cu-card-grow"
+        title = " · ".join(
+            html.escape(str(x))
+            for x in (row["app_name"], row.get("theme", ""), row.get("format", ""))
+            if str(x).strip()
         )
-        st.divider()
+        rev = float(row["revenue_proxy"])
+        if rev >= 1_000_000:
+            rev_s = f"{rev / 1_000_000:.1f}M"
+        elif rev >= 1000:
+            rev_s = f"{rev / 1000:.1f}k"
+        else:
+            rev_s = f"{rev:.0f}"
+        ov = int(round(float(row["similarity"]) * 100))
+        sc = f"{float(row['portfolio_score']):.1f}"
+        meta = html.escape(f"{rev_s} revenue · {ov}% overlap · score {sc}")
+        body = html.escape(str(row["reason"]))
+        st.markdown(
+            f'<div class="cu-card {card}">'
+            f'<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:16px;">'
+            f'<div><span class="cu-badge">{html.escape(label)}</span>'
+            f'<div class="cu-title">{title}</div></div>'
+            f'<div class="cu-meta">{meta}</div></div>'
+            f'<p class="cu-reason">{body}</p></div>',
+            unsafe_allow_html=True,
+        )
 
-def render_analytics(tree_df):
-    """Render analytics summary."""
+
+def render_analytics(tree_df: pd.DataFrame) -> None:
+    if tree_df.empty:
+        return
     col1, col2, col3, col4 = st.columns(4)
-    
+    n = len(tree_df)
     with col1:
-        prune_count = len(tree_df[tree_df["recommendation"] == "PRUNE"])
-        st.metric("Pause", prune_count, f"{prune_count/len(tree_df)*100:.0f}%")
-    
+        prune_count = int((tree_df["recommendation"] == "PRUNE").sum())
+        st.metric("Hold", prune_count, f"{prune_count / n * 100:.0f}%")
     with col2:
-        pursue_count = len(tree_df[tree_df["recommendation"] == "PURSUE"])
-        st.metric("Scale", pursue_count, f"{pursue_count/len(tree_df)*100:.0f}%")
-    
+        pursue_count = int((tree_df["recommendation"] == "PURSUE").sum())
+        st.metric("Grow", pursue_count, f"{pursue_count / n * 100:.0f}%")
     with col3:
-        review_count = len(tree_df[tree_df["recommendation"] == "REVIEW"])
-        st.metric("Monitor", review_count, f"{review_count/len(tree_df)*100:.0f}%")
-    
+        review_count = int((tree_df["recommendation"] == "REVIEW").sum())
+        st.metric("Watch", review_count, f"{review_count / n * 100:.0f}%")
     with col4:
-        total_revenue = tree_df["revenue_proxy"].sum()
-        st.metric("Total Revenue", f"${total_revenue:,.0f}")
+        total_revenue = float(tree_df["revenue_proxy"].sum())
+        st.metric("Revenue", f"${total_revenue:,.0f}")
 
-def main():
+
+def main() -> None:
+    st.set_page_config(
+        page_title="Portfolio",
+        page_icon="✦",
+        layout="wide",
+        initial_sidebar_state="expanded",
+    )
+    st.markdown(STYLE, unsafe_allow_html=True)
+
     render_splash()
     render_header()
-    
-    # Load data
-    df, creatives, campaigns, creative_summary = load_smadex_data()
-    
-    if df is None:
-        st.error("Failed to load Smadex dataset from workspace.")
+
+    dataset_path = _resolve_dataset_path()
+    if not dataset_path:
+        st.error("Creative data is not available. Your administrator needs to connect the workspace.")
         return
-    
-    # Generate tree analysis
-    tree_df = generate_pruning_tree(df)
-    
-    # Sidebar controls
-    st.sidebar.markdown("### Filters", help=None)
-    
-    filter_rec = st.sidebar.multiselect(
-        "Status",
-        ["PRUNE", "PURSUE", "REVIEW"],
-        default=["PRUNE", "PURSUE", "REVIEW"]
+
+    st.sidebar.markdown("### Model mix")
+    main_w = st.sidebar.slider("Core score", 0.0, 30.0, 10.0, 0.5)
+    boost_w = st.sidebar.slider("Revenue lift", 0.0, 5.0, 1.2, 0.05)
+    sim_w = st.sidebar.slider("Similarity", 0.0, 5.0, 1.4, 0.05)
+    max_campaigns = st.sidebar.slider("Campaigns", 1, 180, 24, help="How many campaigns to score in the overview.")
+
+    preview = load_merged_df(dataset_path)
+    if preview is None:
+        st.error("Creative data could not be loaded. Contact support.")
+        return
+
+    tree_df = build_tree_from_backend(
+        dataset_path,
+        max_campaigns=int(max_campaigns),
+        main_w=float(main_w),
+        boost_w=float(boost_w),
+        sim_w=float(sim_w),
     )
-    
+
+    if tree_df.empty:
+        st.error("No scores returned. Check that image assets exist for this dataset.")
+        return
+
+    st.sidebar.markdown("### Filters")
+    filter_labels = st.sidebar.multiselect(
+        "Show",
+        list(STATUS_KEYS.keys()),
+        default=list(STATUS_KEYS.keys()),
+    )
+    filter_rec = [STATUS_KEYS[k] for k in filter_labels] if filter_labels else list(STATUS_KEYS.values())
     min_revenue = st.sidebar.slider(
-        "Minimum Revenue ($)",
+        "Min revenue",
         0.0,
-        tree_df["revenue_proxy"].max(),
+        float(tree_df["revenue_proxy"].max()),
         0.0,
-        step=100.0
+        step=100.0,
     )
-    
     max_sim = st.sidebar.slider(
-        "Maximum Similarity",
-        0.3,
+        "Max overlap",
+        0.0,
         1.0,
         1.0,
-        step=0.05
+        step=0.05,
     )
-    
-    st.sidebar.markdown("---")
-    st.sidebar.markdown(
-        "<div style='font-size: 13px; line-height: 1.6; color: rgba(26, 26, 26, 0.6);'>"
-        "<p style='margin: 0 0 8px 0; font-weight: 500; color: #1A1A1A;'>How recommendations work</p>"
-        "<p style='margin: 0 0 12px 0;'><strong>Pause:</strong> High market overlap with existing campaigns. Reduces wasted spend.</p>"
-        "<p style='margin: 0 0 12px 0;'><strong>Monitor:</strong> Overlap detected. Track performance before scaling.</p>"
-        "<p style='margin: 0;'><strong>Scale:</strong> Low market saturation. Recommended for investment.</p>"
-        "</div>",
-        unsafe_allow_html=True
+
+    _init_history()
+
+    tab_search, tab_history, tab1, tab2, tab3 = st.tabs(
+        ["Search", "History", "Overview", "Summary", "Table"]
     )
-    
-    # Main tabs
-    tab1, tab2, tab3 = st.tabs(["Recommendations", "Analytics", "Details"])
-    
+
+    with tab_search:
+        st.markdown("### Find an app")
+        app_choices = _list_app_names(preview)
+        with st.form("app_search_form", clear_on_submit=False):
+            search_query = st.text_input(
+                "Name",
+                value="",
+                placeholder="Type an app name",
+                help="Matches app name in your data, ignoring case.",
+            )
+            picked = st.selectbox(
+                "Or choose",
+                options=["—"] + app_choices,
+                index=0,
+                help="Overrides the text field.",
+            )
+            submitted = st.form_submit_button("Analyze")
+
+        effective_query = (search_query or "").strip()
+        if picked and picked != "—":
+            effective_query = picked.strip()
+
+        if submitted:
+            if not effective_query:
+                st.warning("Enter an app name or pick one from the list.")
+            else:
+                tree_search = build_tree_for_single_app(
+                    dataset_path,
+                    effective_query,
+                    float(main_w),
+                    float(boost_w),
+                    float(sim_w),
+                )
+                if tree_search.empty:
+                    st.session_state.last_search_snapshot = None
+                    st.error("No match. Try the picker or check spelling.")
+                    _append_history(
+                        {
+                            "timestamp": datetime.now().isoformat(timespec="seconds"),
+                            "app_name": effective_query,
+                            "ok": False,
+                            "tree_df": None,
+                            "error": "No creatives found for that name.",
+                        }
+                    )
+                else:
+                    resolved_name = str(tree_search["app_name"].iloc[0])
+                    snap = tree_search.copy()
+                    st.session_state.last_search_snapshot = {
+                        "app_name": resolved_name,
+                        "df": snap,
+                    }
+                    st.success(f"{resolved_name} · {len(snap)} creatives")
+                    _append_history(
+                        {
+                            "timestamp": datetime.now().isoformat(timespec="seconds"),
+                            "app_name": resolved_name,
+                            "ok": True,
+                            "tree_df": snap,
+                            "error": None,
+                        }
+                    )
+
+        snap = st.session_state.get("last_search_snapshot")
+        if snap and snap.get("df") is not None and not snap["df"].empty:
+            st.divider()
+            st.markdown(f"#### {snap['app_name']}")
+            render_tree_view(
+                snap["df"],
+                filter_recommendation=filter_rec if filter_rec else None,
+                min_revenue=min_revenue,
+                max_similarity=max_sim,
+            )
+
+    with tab_history:
+        st.markdown("### History")
+        hist: List[Dict[str, Any]] = st.session_state.get("analysis_history", [])
+        if not hist:
+            st.caption("Runs you start from Search show up here.")
+        else:
+            for i, entry in enumerate(hist):
+                title = f"{entry['app_name']} · {entry['timestamp']}"
+                if not entry.get("ok", True):
+                    title += " · failed"
+                with st.expander(title, expanded=(i == 0)):
+                    if entry.get("error"):
+                        st.error(entry["error"])
+                    elif entry.get("tree_df") is not None and not entry["tree_df"].empty:
+                        df_h = entry["tree_df"]
+                        st.caption(f"{len(df_h)} creatives")
+                        render_tree_view(
+                            df_h,
+                            filter_recommendation=None,
+                            min_revenue=0.0,
+                            max_similarity=1.0,
+                        )
+                    else:
+                        st.write("No stored results for this entry.")
+
     with tab1:
-        st.markdown("### Portfolio Recommendations")
+        st.markdown("### Overview")
         render_tree_view(
             tree_df,
-            filter_recommendation=filter_rec if len(filter_rec) > 0 else None,
+            filter_recommendation=filter_rec if filter_rec else None,
             min_revenue=min_revenue,
-            max_similarity=max_sim
+            max_similarity=max_sim,
         )
-    
     with tab2:
         st.markdown("### Summary")
         render_analytics(tree_df)
-        
         col1, col2 = st.columns(2, gap="large")
         with col1:
-            st.markdown("#### Market Saturation")
-            st.bar_chart(tree_df["similarity"].value_counts().sort_index())
+            st.caption("Overlap index")
+            st.bar_chart(tree_df[["similarity"]])
         with col2:
-            st.markdown("#### Revenue by Status")
-            rev_by_rec = tree_df.groupby("recommendation")["revenue_proxy"].sum()
-            st.bar_chart(rev_by_rec)
-    
+            st.caption("Revenue by call")
+            rev_by = tree_df.groupby("recommendation")["revenue_proxy"].sum().rename(
+                index=lambda x: STATUS_LABELS.get(str(x), str(x))
+            )
+            st.bar_chart(rev_by)
     with tab3:
-        st.markdown("### All Creatives")
-        display_df = tree_df[["app_name", "theme", "format", "similarity", "revenue_proxy", "ctr", "recommendation"]].copy()
+        st.markdown("### All creatives")
+        display_df = tree_df[
+            [
+                "app_name",
+                "theme",
+                "format",
+                "similarity",
+                "revenue_proxy",
+                "ctr",
+                "portfolio_score",
+                "recommendation",
+            ]
+        ].copy()
         display_df["similarity"] = display_df["similarity"].map(lambda x: f"{x:.0%}")
         display_df["revenue_proxy"] = display_df["revenue_proxy"].map(lambda x: f"${x:.0f}")
         display_df["ctr"] = display_df["ctr"].map(lambda x: f"{x:.2%}")
+        display_df["portfolio_score"] = display_df["portfolio_score"].map(lambda x: f"{x:.2f}")
+        display_df["recommendation"] = display_df["recommendation"].map(
+            lambda x: STATUS_LABELS.get(str(x), str(x))
+        )
         st.dataframe(display_df, use_container_width=True, height=600)
 
 
