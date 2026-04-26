@@ -701,6 +701,37 @@ def render_analytics(tree_df: pd.DataFrame) -> None:
         st.metric("Revenue", f"${total_revenue:,.0f}")
 
 
+def render_cluster_view(cluster_snap: Optional[Dict[str, Any]]) -> None:
+    if not cluster_snap:
+        st.caption("Run an app search first to generate clusters.")
+        return
+
+    cdf = cluster_snap.get("df")
+    if cdf is None or cdf.empty:
+        st.caption(
+            f"No cluster points for {cluster_snap['app_name']} with "
+            f"country={cluster_snap['country']}, language={cluster_snap['language']}, os={cluster_snap['os']}."
+        )
+        return
+
+    st.caption(
+        f"{cluster_snap['app_name']} · country={cluster_snap['country']} · "
+        f"language={cluster_snap['language']} · os={cluster_snap['os']}"
+    )
+    fig = px.scatter_3d(
+        cdf,
+        x="PC1",
+        y="PC2",
+        z="PC3",
+        color=cdf["cluster"].astype(str),
+        hover_data=["creative_id", "cluster", "country", "os", "language"],
+        title="Creative clusters (PCA 3D + HDBSCAN)",
+    )
+    fig.update_traces(marker=dict(size=5, opacity=0.9))
+    fig.update_layout(margin=dict(l=0, r=0, t=40, b=0), height=560)
+    st.plotly_chart(fig, use_container_width=True)
+
+
 def main() -> None:
     st.set_page_config(
         page_title="Portfolio",
@@ -887,6 +918,9 @@ def main() -> None:
         if snap and snap.get("df") is not None and not snap["df"].empty:
             st.divider()
             st.markdown(f"#### {snap['app_name']}")
+            st.markdown("##### 3D clusters")
+            render_cluster_view(st.session_state.get("last_cluster_snapshot"))
+            st.markdown("##### Recommendations")
             render_tree_view(
                 snap["df"],
                 filter_recommendation=filter_rec if filter_rec else None,
@@ -943,33 +977,7 @@ def main() -> None:
 
         st.divider()
         st.markdown("### 3D clusters (from Search filters)")
-        cluster_snap = st.session_state.get("last_cluster_snapshot")
-        if not cluster_snap:
-            st.caption("Run an app search first to generate clusters.")
-        else:
-            cdf = cluster_snap.get("df")
-            if cdf is None or cdf.empty:
-                st.caption(
-                    f"No cluster points for {cluster_snap['app_name']} with "
-                    f"country={cluster_snap['country']}, language={cluster_snap['language']}, os={cluster_snap['os']}."
-                )
-            else:
-                st.caption(
-                    f"{cluster_snap['app_name']} · country={cluster_snap['country']} · "
-                    f"language={cluster_snap['language']} · os={cluster_snap['os']}"
-                )
-                fig = px.scatter_3d(
-                    cdf,
-                    x="PC1",
-                    y="PC2",
-                    z="PC3",
-                    color=cdf["cluster"].astype(str),
-                    hover_data=["creative_id", "cluster", "country", "os", "language"],
-                    title="Creative clusters (PCA 3D + HDBSCAN)",
-                )
-                fig.update_traces(marker=dict(size=5, opacity=0.9))
-                fig.update_layout(margin=dict(l=0, r=0, t=40, b=0), height=560)
-                st.plotly_chart(fig, use_container_width=True)
+        render_cluster_view(st.session_state.get("last_cluster_snapshot"))
     with tab3:
         st.markdown("### All creatives")
         display_df = tree_df[
