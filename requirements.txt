@@ -2,3 +2,6 @@ streamlit
 pandas
 numpy
 Pillow
+scikit-learn
+hdbscan
+plotly

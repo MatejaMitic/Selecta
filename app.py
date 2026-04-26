@@ -17,8 +17,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import numpy as np
 import pandas as pd
+import plotly.express as px
 import streamlit as st
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
+
+import hdbscan
 
 from visual_add_similarity.backend import (
     BackendWeights,
@@ -448,6 +454,8 @@ def _init_history() -> None:
         st.session_state.analysis_history = []
     if "last_search_snapshot" not in st.session_state:
         st.session_state.last_search_snapshot = None
+    if "last_cluster_snapshot" not in st.session_state:
+        st.session_state.last_cluster_snapshot = None
 
 
 def _append_history(entry: Dict[str, Any]) -> None:
@@ -455,6 +463,157 @@ def _append_history(entry: Dict[str, Any]) -> None:
     hist: List[Dict[str, Any]] = st.session_state.analysis_history
     hist.insert(0, entry)
     st.session_state.analysis_history = hist[:50]
+
+
+@st.cache_data(show_spinner=False)
+def _build_cluster_for_filters(
+    dataset_path: str,
+    app_name: str,
+    country: Optional[str],
+    os_name: Optional[str],
+    language: Optional[str],
+) -> pd.DataFrame:
+    root = Path(dataset_path)
+    if root.is_file() and root.suffix.lower() == ".zip":
+        with zipfile.ZipFile(root, "r") as zf:
+            creatives_df = pd.read_csv(zf.open("creatives.csv"))
+            daily_df = pd.read_csv(zf.open("creative_daily_country_os_stats.csv"))
+    else:
+        creatives_df = pd.read_csv(root / "creatives.csv")
+        daily_df = pd.read_csv(root / "creative_daily_country_os_stats.csv")
+
+    app_creatives = creatives_df[creatives_df["app_name"] == app_name].copy()
+    if app_creatives.empty:
+        return pd.DataFrame()
+
+    # Language filter (auto picks mode).
+    target_language = language
+    if "language" in app_creatives.columns:
+        if not target_language:
+            target_language = app_creatives["language"].mode(dropna=True).iloc[0]
+        app_creatives = app_creatives[app_creatives["language"] == target_language]
+    creative_ids = app_creatives["creative_id"]
+    if creative_ids.empty:
+        return pd.DataFrame()
+
+    filtered_stats = daily_df[daily_df["creative_id"].isin(creative_ids)].copy()
+    if filtered_stats.empty:
+        return pd.DataFrame()
+
+    # Country/OS filters (auto picks most frequent pair for comparability).
+    target_country = country
+    target_os = os_name
+    if not target_country or not target_os:
+        pair = filtered_stats[["country", "os"]].value_counts().index[0]
+        target_country = target_country or pair[0]
+        target_os = target_os or pair[1]
+
+    filtered_stats = filtered_stats[
+        (filtered_stats["country"] == target_country) & (filtered_stats["os"] == target_os)
+    ].copy()
+    if filtered_stats.empty:
+        return pd.DataFrame()
+
+    creative_ids = pd.Index(creative_ids)[
+        pd.Index(creative_ids).isin(filtered_stats["creative_id"].unique())
+    ]
+    if creative_ids.empty:
+        return pd.DataFrame()
+
+    rows: List[Dict[str, Any]] = []
+    for creative_id in creative_ids:
+        c = filtered_stats[filtered_stats["creative_id"] == creative_id]
+        rows.append(
+            {
+                "creative_id": int(creative_id),
+                "country": target_country,
+                "os": target_os,
+                "language": target_language,
+                "total_impressions": c["impressions"].sum(),
+                "mean_impressions": c["impressions"].mean(),
+                "std_impressions": c["impressions"].std(),
+                "total_clicks": c["clicks"].sum(),
+                "mean_clicks": c["clicks"].mean(),
+                "ctr": (c["clicks"].sum() / c["impressions"].sum()) * 100 if c["impressions"].sum() > 0 else 0.0,
+                "conversion_rate": (c["conversions"].sum() / c["clicks"].sum()) * 100 if c["clicks"].sum() > 0 else 0.0,
+                "total_revenue": c["revenue_usd"].sum(),
+                "mean_revenue": c["revenue_usd"].mean(),
+                "revenue_per_impression": c["revenue_usd"].sum() / c["impressions"].sum() if c["impressions"].sum() > 0 else 0.0,
+                "engagement_rate": ((c["clicks"].sum() + c["conversions"].sum()) / c["impressions"].sum()) * 100 if c["impressions"].sum() > 0 else 0.0,
+                "video_completion_rate": (c["video_completions"].sum() / c["impressions"].sum()) * 100 if c["impressions"].sum() > 0 else 0.0,
+                "cpc": c["spend_usd"].sum() / c["clicks"].sum() if c["clicks"].sum() > 0 else 0.0,
+                "cpa": c["spend_usd"].sum() / c["conversions"].sum() if c["conversions"].sum() > 0 else 0.0,
+                "cpm": (c["spend_usd"].sum() / c["impressions"].sum()) * 1000 if c["impressions"].sum() > 0 else 0.0,
+                "rpc": c["revenue_usd"].sum() / c["clicks"].sum() if c["clicks"].sum() > 0 else 0.0,
+                "revenue_per_conversion": c["revenue_usd"].sum() / c["conversions"].sum() if c["conversions"].sum() > 0 else 0.0,
+                "viewability_rate": (c["viewable_impressions"].sum() / c["impressions"].sum()) * 100 if c["impressions"].sum() > 0 else 0.0,
+                "click_to_conversion_rate": (c["conversions"].sum() / c["clicks"].sum()) * 100 if c["clicks"].sum() > 0 else 0.0,
+            }
+        )
+
+    features_df = pd.DataFrame(rows)
+    if features_df.empty:
+        return pd.DataFrame()
+
+    num = features_df.select_dtypes(include=["float64", "int64"]).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    scaled = StandardScaler().fit_transform(num)
+    n_components = min(10, scaled.shape[0], scaled.shape[1])
+    if n_components < 3:
+        return pd.DataFrame()
+
+    pca_data = PCA(n_components=n_components).fit_transform(scaled)
+    pca_df = pd.DataFrame(pca_data[:, :3], columns=["PC1", "PC2", "PC3"])
+
+    clusterer = hdbscan.HDBSCAN(
+        min_cluster_size=2,
+        min_samples=1,
+        metric="euclidean",
+        cluster_selection_method="leaf",
+        allow_single_cluster=True,
+    )
+    labels = clusterer.fit_predict(pca_df[["PC1", "PC2", "PC3"]].to_numpy())
+    if (labels == -1).any():
+        next_label = (labels.max() + 1) if labels.max() >= 0 else 0
+        for i in range(len(labels)):
+            if labels[i] == -1:
+                labels[i] = next_label
+                next_label += 1
+
+    pca_df["cluster"] = labels
+    pca_df["creative_id"] = features_df["creative_id"].values
+    pca_df["country"] = target_country
+    pca_df["os"] = target_os
+    pca_df["language"] = target_language
+    return pca_df
+
+
+@st.cache_data(show_spinner=False)
+def _get_app_filter_options(dataset_path: str, app_name: str) -> Dict[str, List[str]]:
+    root = Path(dataset_path)
+    if root.is_file() and root.suffix.lower() == ".zip":
+        with zipfile.ZipFile(root, "r") as zf:
+            creatives_df = pd.read_csv(zf.open("creatives.csv"), usecols=["creative_id", "app_name", "language"])
+            daily_df = pd.read_csv(
+                zf.open("creative_daily_country_os_stats.csv"),
+                usecols=["creative_id", "country", "os"],
+            )
+    else:
+        creatives_df = pd.read_csv(root / "creatives.csv", usecols=["creative_id", "app_name", "language"])
+        daily_df = pd.read_csv(
+            root / "creative_daily_country_os_stats.csv",
+            usecols=["creative_id", "country", "os"],
+        )
+
+    app_creatives = creatives_df[creatives_df["app_name"] == app_name]
+    if app_creatives.empty:
+        return {"languages": [], "countries": [], "oses": []}
+    ids = app_creatives["creative_id"].unique()
+    app_daily = daily_df[daily_df["creative_id"].isin(ids)]
+
+    languages = sorted(app_creatives["language"].dropna().astype(str).unique().tolist())
+    countries = sorted(app_daily["country"].dropna().astype(str).unique().tolist())
+    oses = sorted(app_daily["os"].dropna().astype(str).unique().tolist())
+    return {"languages": languages, "countries": countries, "oses": oses}
 
 
 def render_splash() -> None:
@@ -613,20 +772,53 @@ def main() -> None:
     with tab_search:
         st.markdown("### Find an app")
         app_choices = _list_app_names(preview)
-        with st.form("app_search_form", clear_on_submit=False):
-            search_query = st.text_input(
-                "Name",
-                value="",
-                placeholder="Type an app name",
-                help="Matches app name in your data, ignoring case.",
-            )
-            picked = st.selectbox(
-                "Or choose",
-                options=["—"] + app_choices,
+        search_query = st.text_input(
+            "Name",
+            value=st.session_state.get("search_name", ""),
+            placeholder="Type an app name",
+            help="Matches app name in your data, ignoring case.",
+            key="search_name",
+        )
+        picked = st.selectbox(
+            "Or choose",
+            options=["—"] + app_choices,
+            index=0,
+            help="Overrides the text field.",
+            key="search_pick",
+        )
+        effective_preview = (search_query or "").strip()
+        if picked and picked != "—":
+            effective_preview = picked.strip()
+
+        options = {"languages": [], "countries": [], "oses": []}
+        if effective_preview:
+            options = _get_app_filter_options(dataset_path, effective_preview)
+
+        st.markdown("#### Audience filters")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            language_choice = st.selectbox(
+                "Language",
+                options=["Auto"] + options["languages"] if options["languages"] else ["Auto"],
                 index=0,
-                help="Overrides the text field.",
+                key="search_language",
             )
-            submitted = st.form_submit_button("Analyze")
+        with c2:
+            country_choice = st.selectbox(
+                "Country",
+                options=["Auto"] + options["countries"] if options["countries"] else ["Auto"],
+                index=0,
+                key="search_country",
+            )
+        with c3:
+            os_choice = st.selectbox(
+                "OS",
+                options=["Auto"] + options["oses"] if options["oses"] else ["Auto"],
+                index=0,
+                key="search_os",
+            )
+
+        submitted = st.button("Analyze", key="search_analyze")
 
         effective_query = (search_query or "").strip()
         if picked and picked != "—":
@@ -645,6 +837,7 @@ def main() -> None:
                 )
                 if tree_search.empty:
                     st.session_state.last_search_snapshot = None
+                    st.session_state.last_cluster_snapshot = None
                     st.error("No match. Try the picker or check spelling.")
                     _append_history(
                         {
@@ -657,10 +850,27 @@ def main() -> None:
                     )
                 else:
                     resolved_name = str(tree_search["app_name"].iloc[0])
+                    lang = None if language_choice == "Auto" else language_choice
+                    ctry = None if country_choice == "Auto" else country_choice
+                    os_name = None if os_choice == "Auto" else os_choice
+                    cluster_df = _build_cluster_for_filters(
+                        dataset_path=dataset_path,
+                        app_name=resolved_name,
+                        country=ctry,
+                        os_name=os_name,
+                        language=lang,
+                    )
                     snap = tree_search.copy()
                     st.session_state.last_search_snapshot = {
                         "app_name": resolved_name,
                         "df": snap,
+                    }
+                    st.session_state.last_cluster_snapshot = {
+                        "app_name": resolved_name,
+                        "country": "Auto" if ctry is None else ctry,
+                        "language": "Auto" if lang is None else lang,
+                        "os": "Auto" if os_name is None else os_name,
+                        "df": cluster_df.copy() if not cluster_df.empty else pd.DataFrame(),
                     }
                     st.success(f"{resolved_name} · {len(snap)} creatives")
                     _append_history(
@@ -730,6 +940,36 @@ def main() -> None:
                 index=lambda x: STATUS_LABELS.get(str(x), str(x))
             )
             st.bar_chart(rev_by)
+
+        st.divider()
+        st.markdown("### 3D clusters (from Search filters)")
+        cluster_snap = st.session_state.get("last_cluster_snapshot")
+        if not cluster_snap:
+            st.caption("Run an app search first to generate clusters.")
+        else:
+            cdf = cluster_snap.get("df")
+            if cdf is None or cdf.empty:
+                st.caption(
+                    f"No cluster points for {cluster_snap['app_name']} with "
+                    f"country={cluster_snap['country']}, language={cluster_snap['language']}, os={cluster_snap['os']}."
+                )
+            else:
+                st.caption(
+                    f"{cluster_snap['app_name']} · country={cluster_snap['country']} · "
+                    f"language={cluster_snap['language']} · os={cluster_snap['os']}"
+                )
+                fig = px.scatter_3d(
+                    cdf,
+                    x="PC1",
+                    y="PC2",
+                    z="PC3",
+                    color=cdf["cluster"].astype(str),
+                    hover_data=["creative_id", "cluster", "country", "os", "language"],
+                    title="Creative clusters (PCA 3D + HDBSCAN)",
+                )
+                fig.update_traces(marker=dict(size=5, opacity=0.9))
+                fig.update_layout(margin=dict(l=0, r=0, t=40, b=0), height=560)
+                st.plotly_chart(fig, use_container_width=True)
     with tab3:
         st.markdown("### All creatives")
         display_df = tree_df[
